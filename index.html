@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>離子化合物拼圖學習系統</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Noto Sans TC', sans-serif; overscroll-behavior: none; }
+        .puzzle-piece { transition: transform 0.1s; }
+        @keyframes successPop {
+            0% { transform: scale(0.8); opacity: 0; }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        .success-label { animation: successPop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+        .bg-grid { background-size: 40px 40px; background-image: radial-gradient(circle, #cbd5e1 1px, transparent 1px); }
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        .dragging-item {
+            position: fixed; pointer-events: none; z-index: 9999;
+            filter: drop-shadow(0 15px 25px rgba(0,0,0,0.3)); transform: translate(-50%, -50%);
+        }
+        .snap-target-highlight {
+            box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.4); background-color: rgba(59, 130, 246, 0.1); border-radius: 12px;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 h-screen overflow-hidden select-none touch-none">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // --- Unicode 工具函式 ---
+        const toSuperscript = (num) => {
+            const map = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹' };
+            return num.toString().split('').map(d => map[d]).join('');
+        };
+        const toSubscript = (num) => {
+            const map = { '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉' };
+            return num.toString().split('').map(d => map[d]).join('');
+        };
+
+        // --- 數學工具：最大公因數 ---
+        const gcd = (a, b) => {
+            return b === 0 ? a : gcd(b, a % b);
+        };
+
+        // --- 資料設定 ---
+        const CATIONS = [
+            { id: 'h', name: '氫離子', charge: 1, symbol: 'H', partName: '氫' },
+            { id: 'na', name: '鈉離子', charge: 1, symbol: 'Na', partName: '鈉' },
+            { id: 'k', name: '鉀離子', charge: 1, symbol: 'K', partName: '鉀' },
+            { id: 'ca', name: '鈣離子', charge: 2, symbol: 'Ca', partName: '鈣' },
+            { id: 'al', name: '鋁離子', charge: 3, symbol: 'Al', partName: '鋁' },
+            { id: 'nh4', name: '銨根離子', charge: 1, symbol: 'NH₄', partName: '銨', isPoly: true },
+        ];
+
+        const ANIONS = [
+            { id: 'cl', name: '氯離子', charge: 1, symbol: 'Cl', partName: '氯化' },
+            { id: 'o', name: '氧離子', charge: 2, symbol: 'O', partName: '氧化' },
+            { id: 'oh', name: '氫氧根', charge: 1, symbol: 'OH', partName: '氫氧化', isPoly: true },
+            { id: 'no3', name: '硝酸根', charge: 1, symbol: 'NO₃', partName: '硝酸', isPoly: true },
+            { id: 'so4', name: '硫酸根', charge: 2, symbol: 'SO₄', partName: '硫酸', isPoly: true },
+            { id: 'co3', name: '碳酸根', charge: 2, symbol: 'CO₃', partName: '碳酸', isPoly: true },
+        ];
+
+        const UNIT_HEIGHT = 50; 
+        const PIECE_WIDTH = 80;
+        const TAB_SIZE = 12;
+        const GRID_SIZE = 40;
+        const SNAP_DISTANCE = 150; 
+
+        // --- 核心邏輯：化合物分裂處理 ---
+        // 檢查列表中的化合物，如果發現非最簡比例 (如 K2Cl2)，將其拆分為多個最簡單位 (2個 KCl)
+        const processCompoundsSplitting = (compounds) => {
+            return compounds.flatMap(group => {
+                const { cations, anions, x, y } = group;
+                const totalPos = cations.reduce((acc, c) => acc + c.charge, 0);
+                const totalNeg = anions.reduce((acc, c) => acc + c.charge, 0);
+                
+                // 只有在電荷平衡時才檢查是否需要分裂
+                if (totalPos > 0 && totalNeg > 0 && totalPos === totalNeg) {
+                    const uniqueCations = [...new Set(cations.map(c => c.id))];
+                    const uniqueAnions = [...new Set(anions.map(a => a.id))];
+                    
+                    // 確保不是混合物 (單純化合物)
+                    if (uniqueCations.length === 1 && uniqueAnions.length === 1) {
+                        const cCount = cations.length;
+                        const aCount = anions.length;
+                        const factor = gcd(cCount, aCount);
+                        
+                        // 如果有公因數 (例如 2:2 -> factor 2)，則進行分裂
+                        if (factor > 1) {
+                            const newGroups = [];
+                            const unitCCount = cCount / factor;
+                            const unitACount = aCount / factor;
+                            
+                            for (let i = 0; i < factor; i++) {
+                                // 將離子分配給新的小群組
+                                const chunkCations = cations.slice(i * unitCCount, (i + 1) * unitCCount);
+                                const chunkAnions = anions.slice(i * unitACount, (i + 1) * unitACount);
+                                
+                                // 計算偏移量，讓分裂後的群組左右排開
+                                const spacing = 180; 
+                                const offsetX = (i - (factor - 1) / 2) * spacing;
+                                
+                                newGroups.push({
+                                    ...group,
+                                    id: Date.now() + Math.random() + i, // 確保 ID 唯一
+                                    x: x + offsetX,
+                                    y: y,
+                                    cations: chunkCations,
+                                    anions: chunkAnions
+                                });
+                            }
+                            return newGroups;
+                        }
+                    }
+                }
+                return [group]; // 不需要分裂，維持原樣
+            });
+        };
+
+        // --- 組件定義 ---
+        const PuzzlePiece = ({ type, data, onDelete, isDragging = false }) => {
+            const height = data.charge * UNIT_HEIGHT;
+            const width = PIECE_WIDTH;
+            const colorClass = type === 'cation' ? 'fill-blue-500 stroke-blue-600' : 'fill-red-500 stroke-red-600';
+            const chargeStr = (data.charge > 1 ? toSuperscript(data.charge) : '') + (type === 'cation' ? '⁺' : '⁻');
+            const displaySymbol = `${data.symbol}${chargeStr}`;
+
+            let path = "";
+            if (type === 'cation') {
+                path = `M 0,0 L ${width},0 `;
+                for (let i = 0; i < data.charge; i++) {
+                    const sectionTop = i * UNIT_HEIGHT;
+                    path += `L ${width},${sectionTop + 8} `; 
+                    path += `A ${TAB_SIZE} ${TAB_SIZE} 0 0 0 ${width} ${sectionTop + UNIT_HEIGHT - 8} `;
+                }
+                path += `L ${width},${height} L 0,${height} Z`;
+            } else {
+                path = `M ${width},0 L ${width},${height} L 0,${height} `;
+                for (let i = data.charge - 1; i >= 0; i--) {
+                    const sectionTop = i * UNIT_HEIGHT;
+                    path += `L 0,${sectionTop + UNIT_HEIGHT - 8} `;
+                    path += `A ${TAB_SIZE} ${TAB_SIZE} 0 0 1 0,${sectionTop + 8} `;
+                }
+                path += `L 0,0 Z`;
+            }
+
+            const handleDeleteClick = (e) => { e.stopPropagation(); onDelete(); };
+            const handleMouseDown = (e) => { e.stopPropagation(); };
+
+            return (
+                <div className="relative puzzle-piece" style={{ width: width + (type === 'anion' ? TAB_SIZE : 0), height: height, marginBottom: 1 }}>
+                    <svg width="100%" height="100%" viewBox={`0 0 ${width + (type === 'anion' ? TAB_SIZE : 0)} ${height}`} className={isDragging ? "" : "drop-shadow-sm"}>
+                        <g transform={type === 'anion' ? `translate(${TAB_SIZE}, 0)` : ''}>
+                            <path d={path} className={`${colorClass} stroke-2`} />
+                            <text x={width/2} y={height/2} textAnchor="middle" dominantBaseline="middle" className="fill-white font-bold text-lg pointer-events-none" style={{ fontFamily: "'Noto Sans TC', sans-serif" }}>{displaySymbol}</text>
+                            {!isDragging && onDelete && (
+                                <g className="opacity-0 hover:opacity-100 transition-opacity cursor-pointer group" onClick={handleDeleteClick} onMouseDown={handleMouseDown} onTouchStart={handleMouseDown}>
+                                    <circle cx={width - 12} cy={12} r="8" fill="rgba(0,0,0,0.3)" />
+                                    <text x={width - 12} y={13} textAnchor="middle" dominantBaseline="middle" fill="white" fontSize="10" fontWeight="bold">×</text>
+                                </g>
+                            )}
+                        </g>
+                    </svg>
+                </div>
+            );
+        };
+
+        const CompoundGroup = ({ group, onDeleteIon, onDeleteGroup, onMouseDown, isHighlight, isDraggingSource }) => {
+            const { cations, anions, id, x, y } = group;
+            const totalPos = cations.reduce((acc, c) => acc + c.charge, 0);
+            const totalNeg = anions.reduce((acc, c) => acc + c.charge, 0);
+            const isBalanced = totalPos > 0 && totalNeg > 0 && totalPos === totalNeg;
+
+            let result = null;
+            if (isBalanced) {
+                const uniqueCations = [...new Set(cations.map(c => c.id))];
+                const uniqueAnions = [...new Set(anions.map(a => a.id))];
+                
+                if (uniqueCations.length > 1 || uniqueAnions.length > 1) {
+                    result = { formula: "?", name: "混合", isError: true };
+                } else {
+                    const cType = cations[0];
+                    const aType = anions[0];
+                    const cCount = cations.length;
+                    const aCount = anions.length;
+
+                    // 這裡的 GCD 邏輯保留作為顯示防呆，但因為有自動分裂機制，factor 通常為 1
+                    const factor = gcd(cCount, aCount);
+                    const finalCCount = cCount / factor;
+                    const finalACount = aCount / factor;
+
+                    let cStr = cType.symbol;
+                    if (finalCCount > 1) cStr = cType.isPoly ? `(${cType.symbol})${toSubscript(finalCCount)}` : `${cType.symbol}${toSubscript(finalCCount)}`;
+                    
+                    let aStr = aType.symbol;
+                    if (finalACount > 1) aStr = aType.isPoly ? `(${aType.symbol})${toSubscript(finalACount)}` : `${aType.symbol}${toSubscript(finalACount)}`;
+
+                    let coefficient = factor > 1 ? factor : "";
+                    let formula = `${coefficient}${cStr}${aStr}`;
+                    
+                    let name = `${aType.partName}${cType.partName}`;
+
+                    if (cType.id === 'h') {
+                        if (aType.id === 'cl') name = "氯化氫 (鹽酸)";
+                        else if (aType.id === 'o') name = "水";
+                        else if (aType.id === 'oh') { name = "水"; formula = `${coefficient}H₂O`; }
+                        else if (aType.id === 'no3') name = "硝酸";
+                        else if (aType.id === 'so4') name = "硫酸";
+                        else if (aType.id === 'co3') name = "碳酸";
+                    }
+                    result = { formula, name, isError: false };
+                }
+            }
+
+            const containerStyle = isBalanced 
+                ? 'bg-white/80 shadow-lg border-2 border-green-400' 
+                : 'bg-transparent border-2 border-transparent hover:bg-black/5';
+
+            const highlightStyle = isHighlight ? 'snap-target-highlight' : '';
+            const visibilityStyle = isDraggingSource ? 'opacity-0 pointer-events-none' : 'opacity-100';
+            const handleDeleteGroupClick = (e) => { e.stopPropagation(); onDeleteGroup(id); };
+            const handlePreventDrag = (e) => { e.stopPropagation(); };
+
+            return (
+                <div className={`absolute p-2 rounded-xl transition-all duration-200 cursor-move ${containerStyle} ${highlightStyle} ${visibilityStyle}`} style={{ left: x, top: y, minWidth: isBalanced ? '200px' : 'auto', transform: 'translate(-50%, -50%)', zIndex: isBalanced ? 10 : 1 }} onMouseDown={(e) => onMouseDown(e, group)} onTouchStart={(e) => onMouseDown(e, group)}>
+                    <button onClick={handleDeleteGroupClick} onMouseDown={handlePreventDrag} onTouchStart={handlePreventDrag} className={`absolute -top-3 -right-3 w-6 h-6 bg-slate-300 hover:bg-red-500 hover:text-white rounded-full flex items-center justify-center text-xs text-slate-600 shadow-sm z-20 transition-colors cursor-pointer ${isBalanced ? 'opacity-100' : 'opacity-0 hover:opacity-100'}`}>✕</button>
+                    <div className="flex justify-center items-start gap-0">
+                        <div className="flex flex-col items-end">
+                            {cations.map((ion, idx) => <PuzzlePiece key={ion.uId} type="cation" data={ion} onDelete={() => onDeleteIon(id, 'cation', idx)} />)}
+                        </div>
+                        <div className="flex flex-col items-start">
+                            {anions.map((ion, idx) => <PuzzlePiece key={ion.uId} type="anion" data={ion} onDelete={() => onDeleteIon(id, 'anion', idx)} />)}
+                        </div>
+                    </div>
+                    {isBalanced && result && !result.isError && (
+                        <div className="mt-3 text-center success-label pointer-events-none">
+                            <div className="text-2xl font-bold text-slate-800" style={{ fontFamily: "'Noto Sans TC', sans-serif" }}>{result.formula}</div>
+                            <div className="text-sm font-bold text-slate-600 bg-green-100 px-2 py-1 rounded-full inline-block mt-1" style={{ fontFamily: "'Noto Sans TC', sans-serif" }}>{result.name}</div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const DraggableItem = ({ ion, type, onStartDrag }) => {
+            const chargeStr = (ion.charge > 1 ? toSuperscript(ion.charge) : '') + (type === 'cation' ? '⁺' : '⁻');
+            return (
+                <div onMouseDown={(e) => onStartDrag(e, type, ion)} onTouchStart={(e) => onStartDrag(e, type, ion)} className={`cursor-grab active:cursor-grabbing w-full bg-white border-2 border-slate-200 rounded-xl p-3 flex items-center justify-between group transition-all hover:scale-105 shadow-sm hover:shadow-md mb-3 select-none ${type === 'cation' ? 'hover:border-blue-400 active:bg-blue-50' : 'hover:border-red-400 active:bg-red-50'}`}>
+                    <div className="flex flex-col items-start pointer-events-none">
+                        <span className="font-bold text-lg" style={{ fontFamily: "'Noto Sans TC', sans-serif" }}>{ion.symbol}{chargeStr}</span>
+                        <span className="text-xs text-slate-500">{ion.name}</span>
+                    </div>
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold transition-colors pointer-events-none ${type === 'cation' ? 'bg-blue-100 text-blue-600 group-hover:bg-blue-500' : 'bg-red-100 text-red-600 group-hover:bg-red-500'} text-white`} style={{ backgroundColor: type === 'cation' ? '#3b82f6' : '#ef4444', color: 'white' }}>{type === 'cation' ? '+' : '-'}</div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [compounds, setCompounds] = React.useState([]); 
+            const compoundsRef = React.useRef(compounds);
+            compoundsRef.current = compounds;
+
+            const canvasRef = React.useRef(null);
+            const [showClearConfirm, setShowClearConfirm] = React.useState(false);
+            const [dragState, setDragState] = React.useState({ isDragging: false, type: null, data: null, groupId: null, startX: 0, startY: 0, currentX: 0, currentY: 0, offsetX: 0, offsetY: 0, snapTargetId: null });
+            const dragRef = React.useRef(dragState);
+            dragRef.current = dragState;
+
+            React.useEffect(() => {
+                const handleGlobalMouseMove = (e) => handleMouseMove(e);
+                const handleGlobalMouseUp = (e) => handleMouseUp(e);
+                const handleGlobalTouchMove = (e) => handleTouchMove(e);
+                const handleGlobalTouchEnd = (e) => handleMouseUp(e);
+                if (dragState.isDragging) {
+                    window.addEventListener('mousemove', handleGlobalMouseMove);
+                    window.addEventListener('mouseup', handleGlobalMouseUp);
+                    window.addEventListener('touchmove', handleGlobalTouchMove, { passive: false });
+                    window.addEventListener('touchend', handleGlobalTouchEnd);
+                }
+                return () => {
+                    window.removeEventListener('mousemove', handleGlobalMouseMove);
+                    window.removeEventListener('mouseup', handleGlobalMouseUp);
+                    window.removeEventListener('touchmove', handleGlobalTouchMove);
+                    window.removeEventListener('touchend', handleGlobalTouchEnd);
+                };
+            }, [dragState.isDragging]); 
+
+            const startDragNew = (e, type, ion) => {
+                e.preventDefault(); const clientX = e.touches ? e.touches[0].clientX : e.clientX; const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+                setDragState({ isDragging: true, type: 'new', dataType: type, data: { ...ion, uId: Date.now() + Math.random() }, startX: clientX, startY: clientY, currentX: clientX, currentY: clientY, offsetX: 0, offsetY: 0, snapTargetId: null });
+            };
+
+            const startDragGroup = (e, group) => {
+                e.preventDefault(); e.stopPropagation(); const clientX = e.touches ? e.touches[0].clientX : e.clientX; const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+                if (!canvasRef.current) return;
+                const canvasRect = canvasRef.current.getBoundingClientRect();
+                const canvasX = group.x + canvasRect.left - canvasRef.current.scrollLeft; const canvasY = group.y + canvasRect.top - canvasRef.current.scrollTop;
+                setDragState({ isDragging: true, type: 'group', groupId: group.id, data: group, startX: clientX, startY: clientY, currentX: clientX, currentY: clientY, offsetX: clientX - canvasX, offsetY: clientY - canvasY, snapTargetId: null });
+            };
+
+            const handleMouseMove = (e) => { if (!dragRef.current.isDragging) return; updateDrag(e.clientX, e.clientY, dragRef.current); };
+            const handleTouchMove = (e) => { if (!dragRef.current.isDragging) return; e.preventDefault(); updateDrag(e.touches[0].clientX, e.touches[0].clientY, dragRef.current); };
+
+            const updateDrag = (clientX, clientY, currentState) => {
+                if (!canvasRef.current) return;
+                const canvasRect = canvasRef.current.getBoundingClientRect();
+                const currentCanvasX = clientX - canvasRect.left + canvasRef.current.scrollLeft - currentState.offsetX;
+                const currentCanvasY = clientY - canvasRect.top + canvasRef.current.scrollTop - currentState.offsetY;
+                let minDist = SNAP_DISTANCE; let targetId = null;
+                compoundsRef.current.forEach(g => {
+                    if (currentState.type === 'group' && g.id === currentState.groupId) return;
+                    const dist = Math.sqrt(Math.pow(currentCanvasX - g.x, 2) + Math.pow(currentCanvasY - g.y, 2));
+                    if (dist < minDist) { minDist = dist; targetId = g.id; }
+                });
+                setDragState(prev => ({ ...prev, currentX: clientX, currentY: clientY, snapTargetId: targetId }));
+            };
+
+            const handleMouseUp = () => {
+                const current = dragRef.current; if (!current.isDragging) return;
+                const moveDist = Math.sqrt(Math.pow(current.currentX - current.startX, 2) + Math.pow(current.currentY - current.startY, 2));
+                if (moveDist < 5 && current.type === 'new') addToCenter(current.dataType, current.data);
+                else finalizeDrop(current);
+                setDragState(prev => ({ ...prev, isDragging: false, data: null, groupId: null, snapTargetId: null }));
+            };
+
+            const addToCenter = (type, ionData) => {
+                if (!canvasRef.current) return;
+                const canvas = canvasRef.current;
+                const centerX = canvas.scrollLeft + canvas.clientWidth / 2; const centerY = canvas.scrollTop + canvas.clientHeight / 2;
+                let targetId = null; let minDist = SNAP_DISTANCE;
+                compoundsRef.current.forEach(g => {
+                    const dist = Math.sqrt(Math.pow(centerX - g.x, 2) + Math.pow(centerY - g.y, 2));
+                    if (dist < minDist) { minDist = dist; targetId = g.id; }
+                });
+                if (targetId) addIonToGroup(targetId, type, { ...ionData, uId: Date.now() + Math.random() });
+                else {
+                    const offsetX = (Math.random() - 0.5) * 60; const offsetY = (Math.random() - 0.5) * 60;
+                    createNewGroup(centerX + offsetX, centerY + offsetY, type, { ...ionData, uId: Date.now() + Math.random() });
+                }
+            };
+
+            const finalizeDrop = (finalState) => {
+                if (!canvasRef.current) return;
+                const canvasRect = canvasRef.current.getBoundingClientRect();
+                let dropX = finalState.currentX - canvasRect.left + canvasRef.current.scrollLeft - finalState.offsetX;
+                let dropY = finalState.currentY - canvasRect.top + canvasRef.current.scrollTop - finalState.offsetY;
+                if (finalState.snapTargetId) {
+                    if (finalState.type === 'new') addIonToGroup(finalState.snapTargetId, finalState.dataType, finalState.data);
+                    else if (finalState.type === 'group') mergeGroups(finalState.groupId, finalState.snapTargetId);
+                    return;
+                }
+                dropX = Math.round(dropX / GRID_SIZE) * GRID_SIZE; dropY = Math.round(dropY / GRID_SIZE) * GRID_SIZE; dropX = Math.max(50, dropX); dropY = Math.max(50, dropY);
+                if (finalState.type === 'new') createNewGroup(dropX, dropY, finalState.dataType, finalState.data);
+                else if (finalState.type === 'group') setCompounds(prev => prev.map(g => (g.id === finalState.groupId ? { ...g, x: dropX, y: dropY } : g)));
+            };
+
+            const createNewGroup = (x, y, type, item) => {
+                setCompounds(prev => [...prev, { id: Date.now() + Math.random(), x, y, cations: type === 'cation' ? [item] : [], anions: type === 'anion' ? [item] : [] }]);
+            };
+
+            const addIonToGroup = (groupId, type, item) => {
+                setCompounds(prev => {
+                    const nextCompounds = prev.map(group => {
+                        if (group.id !== groupId) return group;
+                        return mergeLogic(group, type === 'cation' ? [item] : [], type === 'anion' ? [item] : []);
+                    });
+                    return processCompoundsSplitting(nextCompounds);
+                });
+            };
+
+            const mergeGroups = (sourceId, targetId) => {
+                setCompounds(prev => {
+                    const sourceGroup = prev.find(g => g.id === sourceId);
+                    if (!sourceGroup) return prev;
+                    const filtered = prev.filter(g => g.id !== sourceId);
+                    const merged = filtered.map(g => {
+                        if (g.id === targetId) return mergeLogic(g, sourceGroup.cations, sourceGroup.anions);
+                        return g;
+                    });
+                    return processCompoundsSplitting(merged);
+                });
+            };
+
+            const mergeLogic = (baseGroup, newCations, newAnions) => {
+                let finalCations = [...baseGroup.cations]; let finalAnions = [...baseGroup.anions];
+                if (newCations.length > 0) {
+                    const newType = newCations[0].id; const existingType = finalCations.length > 0 ? finalCations[0].id : null;
+                    if (existingType && existingType !== newType) finalCations = newCations; else finalCations = [...finalCations, ...newCations];
+                }
+                if (newAnions.length > 0) {
+                    const newType = newAnions[0].id; const existingType = finalAnions.length > 0 ? finalAnions[0].id : null;
+                    if (existingType && existingType !== newType) finalAnions = newAnions; else finalAnions = [...finalAnions, ...newAnions];
+                }
+                return { ...baseGroup, cations: finalCations, anions: finalAnions };
+            };
+
+            const handleDeleteIon = (groupId, type, idx) => {
+                setCompounds(prev => prev.map(group => {
+                    if (group.id !== groupId) return group;
+                    if (type === 'cation') { const newArr = [...group.cations]; newArr.splice(idx, 1); return { ...group, cations: newArr }; }
+                    else { const newArr = [...group.anions]; newArr.splice(idx, 1); return { ...group, anions: newArr }; }
+                }).filter(g => g.cations.length > 0 || g.anions.length > 0)); 
+            };
+
+            const handleDeleteGroup = (groupId) => setCompounds(prev => prev.filter(g => g.id !== groupId));
+            const handleClearClick = () => setShowClearConfirm(true);
+            const confirmClear = () => { setCompounds([]); setShowClearConfirm(false); };
+
+            return (
+                <div className="flex flex-col h-full bg-slate-100 relative">
+                    {showClearConfirm && (
+                        <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/20 backdrop-blur-sm" onClick={() => setShowClearConfirm(false)}>
+                            <div className="bg-white p-6 rounded-2xl shadow-xl modal-anim border-2 border-slate-100" onClick={(e) => e.stopPropagation()}>
+                                <h3 className="text-lg font-bold text-slate-700 mb-2">確定要清空嗎？</h3>
+                                <p className="text-slate-500 mb-6">桌面上所有的化合物都會消失。</p>
+                                <div className="flex justify-end gap-3">
+                                    <button onClick={() => setShowClearConfirm(false)} className="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded-lg font-bold transition-colors">取消</button>
+                                    <button onClick={confirmClear} className="px-6 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg font-bold shadow-md transition-colors">確認清空</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    {dragState.isDragging && (
+                        <div className="dragging-item" style={{ left: dragState.currentX, top: dragState.currentY }}>
+                            {dragState.type === 'new' ? (
+                                <div className="scale-110 pointer-events-none"><PuzzlePiece type={dragState.dataType} data={dragState.data} isDragging={true} /></div>
+                            ) : (
+                                <div className="scale-105 pointer-events-none">
+                                    <div className="flex">
+                                        <div className="flex flex-col items-end">{dragState.data.cations.map((ion, idx) => <PuzzlePiece key={idx} type="cation" data={ion} isDragging={true} />)}</div>
+                                        <div className="flex flex-col items-start">{dragState.data.anions.map((ion, idx) => <PuzzlePiece key={idx} type="anion" data={ion} isDragging={true} />)}</div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    <header className="bg-white shadow-md p-4 flex justify-between items-center z-20 relative">
+                        <div className="flex items-center gap-2"><div className="w-8 h-8 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-lg flex items-center justify-center text-white font-bold shadow">ion</div><h1 className="text-xl font-bold text-slate-700 hidden md:block">離子化合物實驗室</h1></div>
+                        <div className="text-sm text-slate-500 font-medium hidden sm:block">💡 點擊或拖曳建立離子｜放開自動吸附</div>
+                        <button onClick={handleClearClick} className="bg-slate-200 hover:bg-slate-300 text-slate-600 px-4 py-2 rounded-full transition-colors font-bold text-sm flex items-center gap-2"><span>🗑️</span> 清空全部</button>
+                    </header>
+                    <div className="flex-1 flex overflow-hidden">
+                        <div className="w-64 bg-white border-r border-slate-200 flex flex-col shadow-lg z-10">
+                            <div className="p-4 bg-blue-50 text-blue-800 font-bold text-center border-b border-blue-100">正離子 (陽離子)</div>
+                            <div className="overflow-y-auto p-4 flex-1 scrollbar-hide select-none">{CATIONS.map(ion => <DraggableItem key={ion.id} ion={ion} type="cation" onStartDrag={startDragNew} />)}</div>
+                        </div>
+                        <div ref={canvasRef} className="flex-1 relative bg-grid overflow-auto cursor-crosshair touch-pan-x touch-pan-y" style={{ minWidth: '300px' }}>
+                            {compounds.length === 0 && <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-40"><div className="text-center p-8 border-4 border-dashed border-slate-300 rounded-3xl"><p className="text-4xl mb-4">🖐️</p><p className="text-2xl font-bold text-slate-400 mb-2">拖曳離子到這裡</p></div></div>}
+                            {compounds.map(group => <CompoundGroup key={group.id} group={group} onDeleteIon={handleDeleteIon} onDeleteGroup={handleDeleteGroup} onMouseDown={startDragGroup} isHighlight={dragState.snapTargetId === group.id} isDraggingSource={dragState.isDragging && dragState.groupId === group.id} />)}
+                            <div className="w-full h-[500px] pointer-events-none"></div>
+                        </div>
+                        <div className="w-64 bg-white border-l border-slate-200 flex flex-col shadow-lg z-10">
+                            <div className="p-4 bg-red-50 text-red-800 font-bold text-center border-b border-red-100">負離子 (陰離子)</div>
+                            <div className="overflow-y-auto p-4 flex-1 scrollbar-hide select-none">{ANIONS.map(ion => <DraggableItem key={ion.id} ion={ion} type="anion" onStartDrag={startDragNew} />)}</div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
